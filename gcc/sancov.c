@@ -33,6 +33,7 @@ along with GCC; see the file COPYING3.  If not see
 #include "stmt.h"
 #include "gimple-iterator.h"
 #include "gimple-builder.h"
+#include "gimple-walk.h"
 #include "tree-cfg.h"
 #include "tree-pass.h"
 #include "tree-iterator.h"
@@ -43,7 +44,22 @@ along with GCC; see the file COPYING3.  If not see
 #include "cgraph.h"
 #include "asan.h"
 
+#include <assert.h>
+
+
 namespace {
+
+#define MAX_STRUCT_NAME 0x100
+#define MAP_BLOCK       0x10
+
+struct struct_maps
+{
+  int capacity;
+  int size;
+  char * st[];
+};
+
+struct struct_maps *st_map = NULL;
 
 /* Instrument one comparison operation, which compares lhs and rhs.
    Call the instrumentation function with the comparison operand.
@@ -233,6 +249,64 @@ instrument_switch (gimple_stmt_iterator *gsi, gimple *stmt, function *fun)
   gsi_insert_seq_before (gsi, seq, GSI_SAME_STMT);
 }
 
+void init_structs()
+{
+  char *st_file = getenv("OBJ_FILE");
+  if (st_file != NULL)
+  {
+    st_map = (struct struct_maps*)xmalloc(sizeof(struct struct_maps)+MAP_BLOCK*sizeof(char *));
+    st_map->size = 0;
+    st_map->capacity = MAP_BLOCK;
+    FILE *fp = fopen(st_file, "r");
+
+    if (fp == NULL) {
+      printf("Cannot open $OBJ_FILE");
+      assert (false);
+    }
+    char buf[MAX_STRUCT_NAME] = {};
+    while (1)
+    {
+      fscanf(fp, "%s\n", buf);
+      if (strlen(buf) == 0)
+        break;
+        
+      if (st_map->size == st_map->capacity) {
+        st_map = (struct struct_maps*)xrealloc(st_map, sizeof(struct struct_maps)+(st_map->capacity+MAP_BLOCK)*sizeof(char *));
+        st_map->capacity += MAP_BLOCK;
+      }
+      st_map->st[st_map->size] = xstrdup(buf);
+      st_map->size++;
+      memset(buf, 0, sizeof(buf));
+    }
+  }
+}
+
+tree process_tree(tree t)
+{
+    if (t == NULL_TREE)
+      return NULL;
+
+    if (TREE_CODE(t) == RECORD_TYPE && st_map
+	 && TYPE_IDENTIFIER(t) != NULL_TREE)
+    {
+
+      for (int i=0; i<st_map->size; i++)
+      {
+        if(!strcmp(st_map->st[i], IDENTIFIER_POINTER(TYPE_IDENTIFIER(t)))){
+          return t;
+        }
+      }
+    }
+    return process_tree(TREE_TYPE(t));
+
+}
+
+tree find_st(tree *t, int *walk_subtrees, void *cb_data)
+{
+  *walk_subtrees = 1;
+  return process_tree(*t);
+}
+
 unsigned
 sancov_pass (function *fun)
 {
@@ -242,13 +316,25 @@ sancov_pass (function *fun)
   if (flag_sanitize_coverage & SANITIZE_COV_TRACE_PC)
     {
       basic_block bb;
-      tree fndecl = builtin_decl_implicit (BUILT_IN_SANITIZER_COV_TRACE_PC);
+      tree raw_fndecl = builtin_decl_implicit (BUILT_IN_SANITIZER_COV_TRACE_PC);
+      tree obj_fndecl = builtin_decl_implicit (BUILT_IN_SANITIZER_OBJ_COV_TRACE_PC);
+      tree fndecl;
       FOR_EACH_BB_FN (bb, fun)
 	{
+	  fndecl = raw_fndecl;
 	  gimple_stmt_iterator gsi = gsi_start_nondebug_after_labels_bb (bb);
 	  if (gsi_end_p (gsi))
 	    continue;
 	  gimple *stmt = gsi_stmt (gsi);
+	  gimple_stmt_iterator gsi_walk;
+	  for (gsi_walk = gsi_start_bb (bb); !gsi_end_p (gsi_walk); gsi_next (&gsi_walk))
+	    {
+	      if (walk_gimple_op(gsi_stmt(gsi_walk), find_st, 0))
+	        {
+	          fndecl = obj_fndecl;
+	          break;
+	        }
+	    }
 	  gimple *gcall = gimple_build_call (fndecl, 0);
 	  gimple_set_location (gcall, gimple_location (stmt));
 	  gsi_insert_before (&gsi, gcall, GSI_SAME_STMT);
@@ -304,9 +390,12 @@ sancov_pass (function *fun)
 template <bool O0> class pass_sancov : public gimple_opt_pass
 {
 public:
-  pass_sancov (gcc::context *ctxt) : gimple_opt_pass (data, ctxt) {}
+  pass_sancov (gcc::context *ctxt) : gimple_opt_pass (data, ctxt) {
+    init_structs();
+  }
 
   static const pass_data data;
+  struct struct_maps *st_map;
   opt_pass *
   clone ()
   {
